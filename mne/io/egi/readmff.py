@@ -37,6 +37,8 @@ def _ensure_mffpy_ns_patch():
     ``ValueError`` on these files.  This patch truncates to 6 digits before
     handing off to ``strptime``.  The function is idempotent.
     
+    This function courtesy of Claude because I've never had to do an override
+    
     Temporary until mffpy adds PR: https://github.com/BEL-Public/mffpy/pull/133
     """
     global _mffpy_ns_patch_applied
@@ -78,9 +80,15 @@ def _read_header_mffpy(input_fname):
     Replaces ``_read_header`` from ``egimff.py`` for the mffpy-backed reader.
     All timing uses integer arithmetic on microseconds to avoid float rounding.
     """
+    import mffpy
     from mffpy import Reader, XML
+    
+    from packaging.version import Version
+    
+    if Version(mffpy.__version__) < Version("0.12.0"):
+        _ensure_mffpy_ns_patch()
+    
 
-    _ensure_mffpy_ns_patch()
     reader = Reader(input_fname)
     try:
         flavor = reader.mff_flavor
