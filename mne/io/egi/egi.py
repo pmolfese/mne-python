@@ -11,9 +11,10 @@ from ..._fiff.constants import FIFF
 from ..._fiff.meas_info import _empty_info
 from ..._fiff.utils import _create_chs, _read_segments_file
 from ...annotations import Annotations
-from ...utils import _check_fname, _validate_type, logger, verbose
+from ...utils import _check_fname, _check_option, _validate_type, logger, verbose
 from ..base import BaseRaw
 from .egimff import _read_raw_egi_mff
+from .readmff import _read_raw_egi_mff_mffpy
 from .events import _combine_triggers, _triage_include_exclude
 
 
@@ -100,6 +101,7 @@ def read_raw_egi(
     preload=False,
     channel_naming="E%d",
     *,
+    reader="mne",
     events_as_annotations=True,
     verbose=None,
 ) -> "RawEGI":
@@ -133,6 +135,12 @@ def read_raw_egi(
         effective default prior to 0.14.0 was ``'EEG %%03d'``.
 
         .. versionadded:: 0.14.0
+    reader : {'mne', 'mffpy'}
+        Backend to use for reading ``.mff`` files. The default is ``'mne'``.
+        Use ``'mffpy'`` to read MFF files with the mffpy-backed reader.
+        This parameter is ignored for non-``.mff`` EGI simple binary files.
+
+        .. versionadded:: 1.13
 
     events_as_annotations : bool
         If True, annotations are created from experiment events. If False (default),
@@ -171,9 +179,11 @@ def read_raw_egi(
     _validate_type(input_fname, "path-like", "input_fname")
     input_fname = str(input_fname)
     _validate_type(events_as_annotations, bool, "events_as_annotations")
+    _check_option("reader", reader, ("mne", "mffpy"))
 
     if input_fname.rstrip("/\\").endswith(".mff"):  # allows .mff or .mff/
-        return _read_raw_egi_mff(
+        reader_fun = _read_raw_egi_mff if reader == "mne" else _read_raw_egi_mff_mffpy
+        return reader_fun(
             input_fname,
             eog,
             misc,

@@ -224,6 +224,61 @@ def test_io_egi_mff(events_as_annotations):
         assert np.isclose(pin_hi_sec[0], onset)
 
 
+@requires_testing_data
+def test_read_raw_egi_reader_mffpy_dispatch():
+    """Test public reader dispatch for the mffpy-backed MFF reader."""
+    pytest.importorskip("mffpy", "0.5.7")
+    pytest.importorskip("defusedxml")
+
+    raw = read_raw_egi(egi_mff_fname, reader="mne", verbose="error")
+    assert type(raw).__name__ == "RawMff"
+    raw.close()
+
+    raw = read_raw_egi(egi_mff_fname, reader="mffpy", verbose="error")
+    assert type(raw).__name__ == "RawMffPy"
+    raw.close()
+
+
+@requires_testing_data
+def test_read_raw_egi_reader_mffpy_matches_native():
+    """Test that the mffpy-backed reader matches the native reader on raw MFF."""
+    pytest.importorskip("mffpy", "0.5.7")
+    pytest.importorskip("defusedxml")
+
+    raw_mne = read_raw_egi(egi_mff_fname, reader="mne", verbose="error")
+    raw_mffpy = read_raw_egi(egi_mff_fname, reader="mffpy", verbose="error")
+
+    assert raw_mne.n_times == raw_mffpy.n_times
+    assert raw_mne.info["sfreq"] == raw_mffpy.info["sfreq"]
+    assert raw_mne.info["meas_date"] == raw_mffpy.info["meas_date"]
+    assert raw_mne.info["utc_offset"] == raw_mffpy.info["utc_offset"]
+    assert set(raw_mne.ch_names) == set(raw_mffpy.ch_names)
+
+    ann_mne = sorted(
+        zip(
+            np.round(raw_mne.annotations.onset, decimals=9),
+            np.round(raw_mne.annotations.duration, decimals=9),
+            raw_mne.annotations.description,
+        )
+    )
+    ann_mffpy = sorted(
+        zip(
+            np.round(raw_mffpy.annotations.onset, decimals=9),
+            np.round(raw_mffpy.annotations.duration, decimals=9),
+            raw_mffpy.annotations.description,
+        )
+    )
+    assert ann_mne == ann_mffpy
+
+    for start, stop in ((0, 10), (1000, 1010), (100000, 100010)):
+        want = raw_mne.get_data(start=start, stop=stop)
+        got = raw_mffpy.get_data(start=start, stop=stop)
+        assert_allclose(got, want, atol=1e-9)
+
+    raw_mne.close()
+    raw_mffpy.close()
+
+
 def test_io_egi():
     """Test importing EGI simple binary files."""
     # test default

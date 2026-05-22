@@ -36,6 +36,8 @@ def _ensure_mffpy_ns_patch():
     accepts exactly 6 digits, so the stock mffpy ``_parse_time_str`` raises
     ``ValueError`` on these files.  This patch truncates to 6 digits before
     handing off to ``strptime``.  The function is idempotent.
+    
+    Temporary until mffpy adds PR: https://github.com/BEL-Public/mffpy/pull/133
     """
     global _mffpy_ns_patch_applied
     if _mffpy_ns_patch_applied:
@@ -80,6 +82,17 @@ def _read_header_mffpy(input_fname):
 
     _ensure_mffpy_ns_patch()
     reader = Reader(input_fname)
+    try:
+        flavor = reader.mff_flavor
+    except AttributeError:  # backward compatibility with older mffpy
+        flavor = reader.flavor
+    logger.info('    mffpy detected MFF flavor "%s"', flavor)
+    if flavor != "continuous":
+        raise ValueError(
+            f"{input_fname} is a {flavor} MFF file. "
+            "The mffpy-backed raw reader only supports continuous MFF files."
+            "See mne.read_evokeds_mff() for reading segmented/averaged data"
+        )
 
     # --- Basic EEG signal info ---
     sfreq = reader.sampling_rates["EEG"]
@@ -108,14 +121,15 @@ def _read_header_mffpy(input_fname):
             f"expected channels ({n_channels})."
         )
 
-    # --- Epochs → first_samps, last_samps, samples_block, disk_samps ---
+    # --- Epochs → first_samps, last_samps, eeg_sample_blocks, disk_samps ---
     # Epoch.beginTime / endTime are integers in microseconds from recording
     # start, so the integer-arithmetic conversion is exact.
     epochs_xml = XML.from_file(op.join(input_fname, "epochs.xml"))
+    epochs = epochs_xml.epochs
     first_samps_list = []
     last_samps_list = []
     samples_block_list = []
-    for ep in epochs_xml.epochs:
+    for ep in epochs:
         f = int(ep.beginTime * mult // div)
         l = int(ep.endTime * mult // div)
         first_samps_list.append(f)
@@ -123,7 +137,38 @@ def _read_header_mffpy(input_fname):
         samples_block_list.append(l - f)
     first_samps = np.array(first_samps_list, dtype=np.int64)
     last_samps = np.array(last_samps_list, dtype=np.int64)
-    samples_block = np.array(samples_block_list, dtype=np.int64)
+    eeg_sample_blocks = np.array(samples_block_list, dtype=np.int64)
+    n_epochs = len(first_samps)
+    has_gaps = bool(np.any(first_samps[1:] > last_samps[:-1])) if n_epochs > 1 else False
+    eeg_block_counts = np.array(reader.block_sample_counts["EEG"], dtype=np.int64)
+    logger.info(
+        "    epochs.xml describes %d acquisition span%s (%s)",
+        n_epochs,
+        "" if n_epochs == 1 else "s",
+        "with gaps" if has_gaps else "contiguous",
+    )
+    logger.info(
+        "    EEG signal uses %d binary block%s",
+        len(eeg_block_counts),
+        "" if len(eeg_block_counts) == 1 else "s",
+    )
+    bad = (
+        not (first_samps < last_samps).all()
+        or not (first_samps[1:] >= last_samps[:-1]).all()
+        or eeg_sample_blocks.sum() != eeg_block_counts.sum()
+    )
+    if not bad:
+        for ep, n_epoch_samples in zip(epochs, eeg_sample_blocks):
+            if eeg_block_counts[ep.block_slice].sum() != n_epoch_samples:
+                bad = True
+                break
+    if bad:
+        raise RuntimeError(
+            "EGI epoch/block sample counts could not be reconciled:\n"
+            f"first_samps={list(first_samps)}\n"
+            f"last_samps={list(last_samps)}\n"
+            f"eeg_block_counts={list(eeg_block_counts)}"
+        )
 
     # Virtual timeline: slot i holds the physical disk position of sample i,
     # or -1 where there is an acquisition gap between epochs.
@@ -157,17 +202,13 @@ def _read_header_mffpy(input_fname):
             pns_types.append(ch_type)
             pns_units.append(unit)
 
-        # Get actual per-block PNS sample counts from the binary file headers.
+        # Get actual per-block PNS sample counts from the public reader API.
         # This is the only reliable way to detect the EGI PSG sample bug, where
         # the last PNS block has one fewer sample than the corresponding EEG block.
-        pns_blob = reader._blobs.get("PNSData")
-        if pns_blob is not None:
-            pns_samps_arr = np.array(
-                pns_blob.signal_blocks["num_samples"], dtype=np.int64
-            )
-        else:
-            pns_samps_arr = samples_block.copy()
-        pns_sample_blocks = {"samples_block": pns_samps_arr}
+        pns_sample_blocks = np.array(
+            reader.block_sample_counts.get("PNSData", eeg_sample_blocks),
+            dtype=np.int64,
+        )
 
     return dict(
         sfreq=sfreq,
@@ -179,7 +220,7 @@ def _read_header_mffpy(input_fname):
         numbers=numbers,
         first_samps=first_samps,
         last_samps=last_samps,
-        samples_block=samples_block,
+        eeg_sample_blocks=eeg_sample_blocks,
         disk_samps=disk_samps,
         pns_names=pns_names,
         pns_types=pns_types,
@@ -442,8 +483,8 @@ class RawMffPy(BaseRaw):
         annot = dict(onset=list(), duration=list(), description=list())
 
         if len(idx["pns"]):
-            pns_samples = np.sum(egi_info["pns_sample_blocks"]["samples_block"])
-            eeg_samples = np.sum(egi_info["samples_block"])
+            pns_samples = np.sum(egi_info["pns_sample_blocks"])
+            eeg_samples = np.sum(egi_info["eeg_sample_blocks"])
             if pns_samples == eeg_samples - 1:
                 warn("This file has the EGI PSG sample bug")
                 annot["onset"].append(last_samps[-1] / egi_info["sfreq"])
@@ -486,6 +527,17 @@ class RawMffPy(BaseRaw):
 
         if len(annot["onset"]):
             self.set_annotations(Annotations(**annot))
+
+    def close(self):
+        """Close any open mffpy reader resources."""
+        for extra in getattr(self, "_raw_extras", []):
+            reader = extra.get("_mffpy_reader")
+            if reader is None:
+                continue
+            for blob in getattr(reader, "_blobs", {}).values():
+                blob.close()
+            extra["_mffpy_reader"] = None
+        super().close()
 
     def _read_segment_file(self, data, idx, fi, start, stop, cals, mult):
         """Read a chunk of data via mffpy.get_physical_samples."""
