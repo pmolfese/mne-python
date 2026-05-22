@@ -29,17 +29,12 @@ _mffpy_ns_patch_applied = False
 
 
 def _ensure_mffpy_ns_patch():
-    """Patch mffpy's datetime parser to handle 9-digit (nanosecond) timestamps.
+    """Patch mffpy to accept 9-digit fractional seconds in XML timestamps.
 
-    EGI NetStation sometimes writes timestamps with nanosecond precision, e.g.
-    ``2009-04-01T10:33:02.332000000-05:00``.  Python's ``%f`` directive only
-    accepts exactly 6 digits, so the stock mffpy ``_parse_time_str`` raises
-    ``ValueError`` on these files.  This patch truncates to 6 digits before
-    handing off to ``strptime``.  The function is idempotent.
-    
-    This function courtesy of Claude because I've never had to do an override
-    
-    Temporary until mffpy adds PR: https://github.com/BEL-Public/mffpy/pull/133
+    Notes
+    -----
+    Temporary until mffpy includes
+    https://github.com/BEL-Public/mffpy/pull/133.
     """
     global _mffpy_ns_patch_applied
     if _mffpy_ns_patch_applied:
@@ -60,10 +55,7 @@ def _ensure_mffpy_ns_patch():
 
 
 def _dt_to_sample(event_dt, start_dt, sfreq):
-    """Convert a timezone-aware event datetime to a sample index.
-
-    Uses integer arithmetic on microseconds to avoid float rounding errors.
-    """
+    """Convert an event datetime to a sample index exactly."""
     td = event_dt - start_dt
     # timedelta stores days/seconds/microseconds as Python ints
     total_us = (
@@ -75,19 +67,32 @@ def _dt_to_sample(event_dt, start_dt, sfreq):
 
 
 def _read_header_mffpy(input_fname):
-    """Read EGI MFF header using mffpy, returning an egi_info dict.
+    """Read EGI MFF header information using mffpy.
 
-    Replaces ``_read_header`` from ``egimff.py`` for the mffpy-backed reader.
-    All timing uses integer arithmetic on microseconds to avoid float rounding.
+    Parameters
+    ----------
+    input_fname : path-like
+        Path to the MFF directory.
+
+    Returns
+    -------
+    egi_info : dict
+        Dictionary containing header information needed to construct a raw
+        object and perform on-demand reads.
+
+    Notes
+    -----
+    This function replaces ``_read_header`` from ``egimff.py`` for the
+    mffpy-backed reader. Timing is converted using integer arithmetic to
+    preserve exact sample alignment.
     """
+    from packaging.version import Version
+
     import mffpy
     from mffpy import Reader, XML
-    
-    from packaging.version import Version
-    
+
     if Version(mffpy.__version__) < Version("0.12.0"):
         _ensure_mffpy_ns_patch()
-    
 
     reader = Reader(input_fname)
     try:
@@ -98,8 +103,8 @@ def _read_header_mffpy(input_fname):
     if flavor != "continuous":
         raise ValueError(
             f"{input_fname} is a {flavor} MFF file. "
-            "The mffpy-backed raw reader only supports continuous MFF files."
-            "See mne.read_evokeds_mff() for reading segmented/averaged data"
+            "The mffpy-backed raw reader only supports continuous MFF files. "
+            "Use mne.read_evokeds_mff() for segmented or averaged MFF data."
         )
 
     # --- Basic EEG signal info ---
@@ -130,8 +135,6 @@ def _read_header_mffpy(input_fname):
         )
 
     # --- Epochs → first_samps, last_samps, eeg_sample_blocks, disk_samps ---
-    # Epoch.beginTime / endTime are integers in microseconds from recording
-    # start, so the integer-arithmetic conversion is exact.
     epochs_xml = XML.from_file(op.join(input_fname, "epochs.xml"))
     epochs = epochs_xml.epochs
     first_samps_list = []
@@ -210,9 +213,8 @@ def _read_header_mffpy(input_fname):
             pns_types.append(ch_type)
             pns_units.append(unit)
 
-        # Get actual per-block PNS sample counts from the public reader API.
-        # This is the only reliable way to detect the EGI PSG sample bug, where
-        # the last PNS block has one fewer sample than the corresponding EEG block.
+        # Detect the EGI PSG sample bug, where the last PNS block has one
+        # fewer sample than the corresponding EEG block.
         pns_sample_blocks = np.array(
             reader.block_sample_counts.get("PNSData", eeg_sample_blocks),
             dtype=np.int64,
@@ -243,8 +245,27 @@ def _read_header_mffpy(input_fname):
 def _read_mff_events_mffpy(input_fname, egi_info):
     """Read MFF event tracks using mffpy.
 
-    Replaces ``_read_events`` from ``events.py`` for the mffpy-backed reader.
-    Returns the same three-tuple ``(events_array, egi_info, mff_events_dict)``.
+    Parameters
+    ----------
+    input_fname : path-like
+        Path to the MFF directory.
+    egi_info : dict
+        Header information dictionary returned by
+        :func:`_read_header_mffpy`.
+
+    Returns
+    -------
+    events : ndarray, shape (n_events, n_samples)
+        Event matrix used internally for event-channel synthesis.
+    egi_info : dict
+        Updated header information dictionary.
+    mff_events : dict
+        Dictionary mapping event codes to lists of event sample indices.
+
+    Notes
+    -----
+    This function replaces ``_read_events`` from ``events.py`` for the
+    mffpy-backed reader.
     """
     import mffpy
     from mffpy import Reader, XML
@@ -298,7 +319,41 @@ def _read_raw_egi_mff_mffpy(
     events_as_annotations=True,
     verbose=None,
 ):
-    """Read EGI MFF file using mffpy for precise event timing."""
+    """Read a continuous EGI MFF file using the mffpy backend.
+
+    Parameters
+    ----------
+    input_fname : path-like
+        Path to the MFF directory.
+    eog : list | tuple | None
+        Names of channels or list of indices that should be designated
+        EOG channels.
+    misc : list | tuple | None
+        Names of channels or list of indices that should be designated
+        MISC channels.
+    include : list | None
+        Event channels to include when creating annotations or a synthetic
+        trigger channel.
+    exclude : list | None
+        Event channels to exclude when creating annotations or a synthetic
+        trigger channel.
+    %(preload)s
+    channel_naming : str
+        Channel naming convention for EEG channels.
+    events_as_annotations : bool
+        If True, create annotations from experiment events. If False,
+        synthesize a trigger channel ``STI 014``.
+    %(verbose)s
+
+    Returns
+    -------
+    raw : instance of RawMffPy
+        The raw object.
+
+    Notes
+    -----
+    Only continuous MFF files are supported by this backend.
+    """
     return RawMffPy(
         input_fname,
         eog,
@@ -320,9 +375,6 @@ class RawMffPy(BaseRaw):
     so all MNE channel ``cal`` values are ``1.0`` for EEG.  PNS channel
     calibration is applied by mffpy's unit scaling, then by MNE's per-channel
     ``cal`` values set in :func:`_add_pns_channel_info`.
-
-    The ``_read_segment_file`` method uses ``Reader.get_physical_samples``
-    rather than direct block-level binary reads.
     """
 
     _extra_attributes = ("event_id",)
@@ -341,7 +393,32 @@ class RawMffPy(BaseRaw):
         events_as_annotations=True,
         verbose=None,
     ):
-        """Init RawMffPy."""
+        """Initialize a raw object from a continuous EGI MFF file.
+
+        Parameters
+        ----------
+        input_fname : path-like
+            Path to the MFF directory.
+        eog : list | tuple | None
+            Names of channels or list of indices that should be designated
+            EOG channels.
+        misc : list | tuple | None
+            Names of channels or list of indices that should be designated
+            MISC channels.
+        include : list | None
+            Event channels to include when creating annotations or a synthetic
+            trigger channel.
+        exclude : list | None
+            Event channels to exclude when creating annotations or a synthetic
+            trigger channel.
+        %(preload)s
+        channel_naming : str
+            Channel naming convention for EEG channels.
+        events_as_annotations : bool
+            If True, create annotations from experiment events. If False,
+            synthesize a trigger channel ``STI 014``.
+        %(verbose)s
+        """
         import mffpy
         from mffpy import Reader
 
@@ -361,8 +438,7 @@ class RawMffPy(BaseRaw):
         if misc is None:
             misc = np.where(np.array(egi_info["chan_type"]) != "eeg")[0].tolist()
 
-        # Build the mffpy Reader and configure it to return Volts.
-        # GCAL calibration is auto-loaded by mffpy on Reader init.
+        # mffpy loads GCAL automatically on Reader init.
         reader = Reader(input_fname)
         reader.set_unit("EEG", "V")
         if "PNSData" in reader.sampling_rates:
@@ -409,6 +485,7 @@ class RawMffPy(BaseRaw):
         info["utc_offset"] = egi_info["utc_offset"]
         info["device_info"] = dict(type=egi_info["device"])
 
+        # Reuse the native MFF location/montage handling.
         ch_names, mon = _read_locs(input_fname, egi_info, channel_naming)
         ch_names.extend(list(egi_info["event_codes"]))
         n_extra = len(event_codes) + len(misc) + len(eog) + len(egi_info["pns_names"])
