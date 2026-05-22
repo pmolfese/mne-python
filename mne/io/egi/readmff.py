@@ -25,35 +25,6 @@ from .egimff import (
 from .events import _combine_triggers, _triage_include_exclude
 
 
-_mffpy_ns_patch_applied = False
-
-
-def _ensure_mffpy_ns_patch():
-    """Patch mffpy to accept 9-digit fractional seconds in XML timestamps.
-
-    Notes
-    -----
-    Temporary until mffpy includes
-    https://github.com/BEL-Public/mffpy/pull/133.
-    """
-    global _mffpy_ns_patch_applied
-    if _mffpy_ns_patch_applied:
-        return
-    import re
-    from mffpy.xml_files import XML
-
-    @classmethod
-    def _parse_time_str_ns(cls, txt):
-        if txt.count(":") == 3:
-            txt = txt[::-1].replace(":", "", 1)[::-1]
-        # Truncate 9-digit nanoseconds → 6-digit microseconds for strptime.
-        txt = re.sub(r"(\.\d{6})\d+", r"\1", txt)
-        return datetime.datetime.strptime(txt, "%Y-%m-%dT%H:%M:%S.%f%z")
-
-    XML._parse_time_str = _parse_time_str_ns
-    _mffpy_ns_patch_applied = True
-
-
 def _dt_to_sample(event_dt, start_dt, sfreq):
     """Convert an event datetime to a sample index exactly."""
     td = event_dt - start_dt
@@ -86,19 +57,30 @@ def _read_header_mffpy(input_fname):
     mffpy-backed reader. Timing is converted using integer arithmetic to
     preserve exact sample alignment.
     """
-    from packaging.version import Version
-
     import mffpy
     from mffpy import Reader, XML
 
-    if Version(mffpy.__version__) < Version("0.12.0"):
-        _ensure_mffpy_ns_patch()
-
     reader = Reader(input_fname)
+
+    # Check for the public mffpy APIs this reader relies on.
+    missing = []
+    if not hasattr(reader, "block_sample_counts"):
+        missing.append("Reader.block_sample_counts")
+    if not hasattr(reader, "mff_flavor"):
+        missing.append("Reader.mff_flavor")
     try:
-        flavor = reader.mff_flavor
-    except AttributeError:  # backward compatibility with older mffpy
-        flavor = reader.flavor
+        XML._parse_time_str("2009-04-01T10:33:02.332000000-05:00")
+    except Exception:
+        missing.append("9-digit XML timestamp parsing")
+    if missing:
+        missing = ", ".join(missing)
+        raise ImportError(
+            "The mffpy-backed raw MFF reader requires a newer mffpy with "
+            f"public support for {missing}. Found mffpy {mffpy.__version__}. "
+            "See https://pypi.org/project/mffpy/ or "
+            "https://github.com/BEL-Public/mffpy."
+        )
+    flavor = reader.mff_flavor
     logger.info('    mffpy detected MFF flavor "%s"', flavor)
     if flavor != "continuous":
         raise ValueError(
@@ -267,10 +249,8 @@ def _read_mff_events_mffpy(input_fname, egi_info):
     This function replaces ``_read_events`` from ``events.py`` for the
     mffpy-backed reader.
     """
-    import mffpy
     from mffpy import Reader, XML
 
-    _ensure_mffpy_ns_patch()
     reader = Reader(input_fname)
     start_dt = reader.startdatetime
     sfreq = egi_info["sfreq"]
