@@ -15,7 +15,7 @@ from ..._fiff.constants import FIFF
 from ..._fiff.meas_info import _empty_info, _ensure_meas_date_none_or_dt
 from ..._fiff.utils import _create_chs, _mult_cal_one
 from ...annotations import Annotations
-from ...utils import _check_fname, logger, verbose, warn
+from ...utils import _check_fname, _soft_import, logger, verbose, warn
 from ..base import BaseRaw
 from .egimff import (
     REFERENCE_NAMES,
@@ -57,7 +57,7 @@ def _read_header_mffpy(input_fname):
     mffpy-backed reader. Timing is converted using integer arithmetic to
     preserve exact sample alignment.
     """
-    import mffpy
+    mffpy = _soft_import("mffpy", "reading EGI MFF data")
     from mffpy import Reader, XML
 
     reader = Reader(input_fname)
@@ -184,10 +184,10 @@ def _read_header_mffpy(input_fname):
         for _, sensor in sorted(pns_set.sensors.items()):
             name = sensor["name"]
             unit = sensor.get("unit", "")
-            stype = sensor.get("sensorType", "")
-            if name == "ECG":
+            stype = sensor.get("sensorType", "").upper()
+            if stype == "ECG":
                 ch_type = "ecg"
-            elif "EMG" in name:
+            elif stype == "EMG":
                 ch_type = "emg"
             else:
                 ch_type = "bio"
@@ -399,7 +399,6 @@ class RawMffPy(BaseRaw):
             synthesize a trigger channel ``STI 014``.
         %(verbose)s
         """
-        import mffpy
         from mffpy import Reader
 
         input_fname = str(
