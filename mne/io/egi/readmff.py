@@ -7,6 +7,7 @@
 import datetime
 import math
 import os.path as op
+from collections import OrderedDict
 from glob import glob
 
 import numpy as np
@@ -15,14 +16,76 @@ from ..._fiff.constants import FIFF
 from ..._fiff.meas_info import _empty_info, _ensure_meas_date_none_or_dt
 from ..._fiff.utils import _create_chs, _mult_cal_one
 from ...annotations import Annotations
+from ...channels.montage import make_dig_montage
 from ...utils import _check_fname, _soft_import, logger, verbose, warn
 from ..base import BaseRaw
-from .egimff import (
-    REFERENCE_NAMES,
-    _add_pns_channel_info,
-    _read_locs,
-)
 from .events import _combine_triggers, _triage_include_exclude
+
+
+REFERENCE_NAMES = ("VREF", "Vertex Reference")
+
+
+def _add_pns_channel_info_mffpy(chs, egi_info, ch_names):
+    """Add info for PNS channels to channel info dict."""
+    for i_ch, ch_name in enumerate(egi_info["pns_names"]):
+        idx = ch_names.index(ch_name)
+        ch_type = egi_info["pns_types"][i_ch]
+        type_to_kind_map = {"ecg": FIFF.FIFFV_ECG_CH, "emg": FIFF.FIFFV_EMG_CH}
+        ch_kind = type_to_kind_map.get(ch_type, FIFF.FIFFV_BIO_CH)
+        ch_unit = FIFF.FIFF_UNIT_V
+        ch_cal = 1e-6
+        if egi_info["pns_units"][i_ch] != "uV":
+            ch_unit = FIFF.FIFF_UNIT_NONE
+            ch_cal = 1.0
+        chs[idx].update(
+            cal=ch_cal, kind=ch_kind, coil_type=FIFF.FIFFV_COIL_NONE, unit=ch_unit
+        )
+    return chs
+
+
+def _read_locs_mffpy(filepath, egi_info, channel_naming):
+    """Read channel locations from coordinates.xml using mffpy."""
+    from mffpy import XML
+
+    fname = op.join(filepath, "coordinates.xml")
+    if not op.exists(fname):
+        warn("File coordinates.xml not found, not setting channel locations")
+        ch_names = [channel_naming % (i + 1) for i in range(egi_info["n_channels"])]
+        return ch_names, None
+
+    dig_ident_map = {
+        "Left periauricular point": "lpa",
+        "Right periauricular point": "rpa",
+        "Nasion": "nasion",
+    }
+    numbers = np.array(egi_info["numbers"])
+    coordinates = XML.from_file(fname)
+    ch_pos = OrderedDict()
+    hsp = []
+    nlr = {}
+    ch_names = []
+
+    for _, sensor in sorted(coordinates.sensors.items()):
+        name = sensor.get("name")
+        if name in ("None", "", None):
+            ch_name = channel_naming % int(sensor["number"])
+        else:
+            ch_name = name
+        nr = str(sensor["number"]).encode()
+        loc = np.array([sensor["x"], sensor["y"], sensor["z"]], float) / 100.0
+
+        if ch_name in dig_ident_map:
+            nlr[dig_ident_map[ch_name]] = loc
+        else:
+            id_ = np.flatnonzero(numbers == nr)
+            if len(id_) == 0:
+                hsp.append(loc)
+            else:
+                ch_names.append(ch_name)
+                ch_pos[ch_name] = loc
+
+    mon = make_dig_montage(ch_pos=ch_pos, hsp=hsp, **nlr)
+    return ch_names, mon
 
 
 def _dt_to_sample(event_dt, start_dt, sfreq):
@@ -464,8 +527,7 @@ class RawMffPy(BaseRaw):
         info["utc_offset"] = egi_info["utc_offset"]
         info["device_info"] = dict(type=egi_info["device"])
 
-        # Reuse the native MFF location/montage handling.
-        ch_names, mon = _read_locs(input_fname, egi_info, channel_naming)
+        ch_names, mon = _read_locs_mffpy(input_fname, egi_info, channel_naming)
         ch_names.extend(list(egi_info["event_codes"]))
         n_extra = len(event_codes) + len(misc) + len(eog) + len(egi_info["pns_names"])
         if egi_info["new_trigger"] is not None:
@@ -496,8 +558,7 @@ class RawMffPy(BaseRaw):
                 }
             )
         # PNS channels: mffpy returns Volts (set_unit above), so cal stays 1.0.
-        # _add_pns_channel_info sets kind/coil_type/unit but we override cal=1.0.
-        chs = _add_pns_channel_info(chs, egi_info, ch_names)
+        chs = _add_pns_channel_info_mffpy(chs, egi_info, ch_names)
         for ch_name in egi_info["pns_names"]:
             chs[ch_names.index(ch_name)]["cal"] = 1.0
 
