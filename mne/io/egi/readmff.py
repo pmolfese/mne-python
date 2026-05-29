@@ -17,7 +17,7 @@ from ..._fiff.meas_info import _empty_info, _ensure_meas_date_none_or_dt
 from ..._fiff.utils import _create_chs, _mult_cal_one
 from ...annotations import Annotations
 from ...channels.montage import make_dig_montage
-from ...utils import _check_fname, _soft_import, logger, verbose, warn
+from ...utils import _check_fname, _check_option, _soft_import, logger, verbose, warn
 from ..base import BaseRaw
 from .events import _combine_triggers, _triage_include_exclude
 
@@ -306,6 +306,10 @@ def _read_mff_events_mffpy(input_fname, egi_info):
         Updated header information dictionary.
     mff_events : dict
         Dictionary mapping event codes to lists of event sample indices.
+    markers : list of (str, int, str)
+        Per-event records of ``(code, sample, label)``. The ``label`` is the
+        human-readable label harvested from the MFF event, falling back to
+        ``code`` when the event has no label. Used for building annotations.
 
     Notes
     -----
@@ -320,7 +324,7 @@ def _read_mff_events_mffpy(input_fname, egi_info):
     n_samples = egi_info["last_samps"][-1]
 
     codes = []
-    markers = []  # list of (code, sample_int)
+    markers = []  # list of (code, sample_int, label)
 
     for evfile in sorted(glob(op.join(input_fname, "Events_*.xml"))):
         track = XML.from_file(evfile)
@@ -329,12 +333,17 @@ def _read_mff_events_mffpy(input_fname, egi_info):
             if code is None:
                 continue
             sample = _dt_to_sample(event["beginTime"], start_dt, sfreq)
+            # mffpy parses an empty <label/> element to the string "None", so
+            # guard against both a missing key and that sentinel.
+            label = event.get("label")
+            if label is None or label == "None":
+                label = code
             if code not in codes:
                 codes.append(code)
-            markers.append((code, sample))
+            markers.append((code, sample, label))
 
     mff_events = {code: [] for code in codes}
-    for code, sample in markers:
+    for code, sample, _ in markers:
         mff_events[code].append(sample)
 
     egi_info["n_events"] = len(codes)
@@ -346,7 +355,7 @@ def _read_mff_events_mffpy(input_fname, egi_info):
             if 0 <= i < n_samples:
                 events[n, i] = n + 1
 
-    return events, egi_info, mff_events
+    return events, egi_info, mff_events, markers
 
 
 @verbose
@@ -360,6 +369,7 @@ def _read_raw_egi_mff_mffpy(
     channel_naming="E%d",
     *,
     events_as_annotations=True,
+    event_label="code",
     verbose=None,
 ):
     """Read a continuous EGI MFF file using the mffpy backend.
@@ -386,6 +396,13 @@ def _read_raw_egi_mff_mffpy(
     events_as_annotations : bool
         If True, create annotations from experiment events. If False,
         synthesize a trigger channel ``STI 014``.
+    event_label : {'code', 'label', 'code/label'}
+        How to build annotation descriptions from MFF events when
+        ``events_as_annotations`` is True. ``'code'`` (default) uses the short
+        event code (e.g. ``'CELL'``); ``'label'`` uses the human-readable label
+        (e.g. ``'TARG'``); ``'code/label'`` combines both hierarchically (e.g.
+        ``'CELL/TARG'``). When an event has no label, ``code`` is used in all
+        cases.
     %(verbose)s
 
     Returns
@@ -406,6 +423,7 @@ def _read_raw_egi_mff_mffpy(
         preload,
         channel_naming,
         events_as_annotations=events_as_annotations,
+        event_label=event_label,
         verbose=verbose,
     )
 
@@ -434,6 +452,7 @@ class RawMffPy(BaseRaw):
         channel_naming="E%d",
         *,
         events_as_annotations=True,
+        event_label="code",
         verbose=None,
     ):
         """Initialize a raw object from a continuous EGI MFF file.
@@ -460,9 +479,20 @@ class RawMffPy(BaseRaw):
         events_as_annotations : bool
             If True, create annotations from experiment events. If False,
             synthesize a trigger channel ``STI 014``.
+        event_label : {'code', 'label', 'code/label'}
+            How to build annotation descriptions from MFF events when
+            ``events_as_annotations`` is True. ``'code'`` (default) uses the
+            short event code (e.g. ``'CELL'``); ``'label'`` uses the
+            human-readable label (e.g. ``'TARG'``); ``'code/label'`` combines
+            both hierarchically (e.g. ``'CELL/TARG'``). When an event has no
+            label, ``code`` is used in all cases.
         %(verbose)s
         """
         from mffpy import Reader
+
+        _check_option(
+            "event_label", event_label, ("code", "label", "code/label")
+        )
 
         input_fname = str(
             _check_fname(
@@ -487,7 +517,7 @@ class RawMffPy(BaseRaw):
             reader.set_unit("PNSData", "V")
 
         logger.info("    Reading events via mffpy ...")
-        egi_events, egi_info, mff_events = _read_mff_events_mffpy(
+        egi_events, egi_info, mff_events, markers = _read_mff_events_mffpy(
             input_fname, egi_info
         )
 
@@ -643,12 +673,19 @@ class RawMffPy(BaseRaw):
                 annot["description"].append("BAD_ACQ_SKIP")
 
         if events_as_annotations:
-            for code, samples in mff_events.items():
+            for code, sample, label in markers:
                 if code not in include:
                     continue
-                annot["onset"].extend(np.array(samples) / egi_info["sfreq"])
-                annot["duration"].extend([0.0] * len(samples))
-                annot["description"].extend([code] * len(samples))
+                if event_label == "label":
+                    description = label
+                elif event_label == "code/label":
+                    # Collapse to bare code when the label adds nothing.
+                    description = code if label == code else f"{code}/{label}"
+                else:  # "code"
+                    description = code
+                annot["onset"].append(sample / egi_info["sfreq"])
+                annot["duration"].append(0.0)
+                annot["description"].append(description)
 
         if len(annot["onset"]):
             self.set_annotations(Annotations(**annot))

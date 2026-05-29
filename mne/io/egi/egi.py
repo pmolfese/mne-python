@@ -103,6 +103,7 @@ def read_raw_egi(
     *,
     reader="mne",
     events_as_annotations=True,
+    event_label="code",
     verbose=None,
 ) -> "RawEGI":
     """Read EGI simple binary as raw object.
@@ -149,6 +150,15 @@ def read_raw_egi(
         The default will change from False to True in version 1.9.
 
         .. versionadded:: 1.8.0
+    event_label : {'code', 'label', 'code/label'}
+        How to build annotation descriptions from MFF events when
+        ``events_as_annotations`` is True. ``'code'`` (default) uses the short
+        event code (e.g. ``'CELL'``); ``'label'`` uses the human-readable label
+        (e.g. ``'TARG'``); ``'code/label'`` combines both hierarchically (e.g.
+        ``'CELL/TARG'``). When an event has no label, ``code`` is used in all
+        cases. Only supported by the ``'mffpy'`` reader.
+
+        .. versionadded:: 1.13
     %(verbose)s
 
     Returns
@@ -180,10 +190,27 @@ def read_raw_egi(
     input_fname = str(input_fname)
     _validate_type(events_as_annotations, bool, "events_as_annotations")
     _check_option("reader", reader, ("mne", "mffpy"))
+    _check_option("event_label", event_label, ("code", "label", "code/label"))
 
     if input_fname.rstrip("/\\").endswith(".mff"):  # allows .mff or .mff/
-        reader_fun = _read_raw_egi_mff if reader == "mne" else _read_raw_egi_mff_mffpy
-        return reader_fun(
+        if reader == "mne":
+            if event_label != "code":
+                raise ValueError(
+                    "event_label is only supported by the 'mffpy' reader; got "
+                    f"event_label={event_label!r} with reader='mne'."
+                )
+            return _read_raw_egi_mff(
+                input_fname,
+                eog,
+                misc,
+                include,
+                exclude,
+                preload,
+                channel_naming,
+                events_as_annotations=events_as_annotations,
+                verbose=verbose,
+            )
+        return _read_raw_egi_mff_mffpy(
             input_fname,
             eog,
             misc,
@@ -192,6 +219,7 @@ def read_raw_egi(
             preload,
             channel_naming,
             events_as_annotations=events_as_annotations,
+            event_label=event_label,
             verbose=verbose,
         )
     return RawEGI(
