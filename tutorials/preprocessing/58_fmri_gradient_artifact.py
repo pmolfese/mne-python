@@ -250,9 +250,11 @@ raw_clean = remove_fmri_gradient_artifact(raw, events, n_average=25)
 #         motion="motion.1D",
 #         motion_source="afni",
 #         motion_threshold=0.5,
+#         motion_metric="framewise_displacement",
 #     )
 #
-# Here, ``motion_threshold`` is framewise displacement in millimeters. A
+# Here, ``motion_threshold`` is measured in millimeters using either framewise
+# displacement (the default) or the Euclidean norm of the motion changes. A
 # volume above the threshold is still corrected, but it cannot contribute to
 # any artifact template.
 

@@ -58,11 +58,16 @@ class GradientRemover:
         contain X/Y/Z translations in mm followed by pitch/roll/yaw rotations
         in radians.
     motion_threshold : float | None
-        Maximum framewise displacement in mm for a volume to contribute to an
-        artifact template. Framewise displacement is the sum of absolute
-        translation changes plus rotation changes converted to displacement
-        using ``head_radius``. If ``None``, all volumes are motion eligible.
-        Default ``None``.
+        Maximum motion score in mm for a volume to contribute to an artifact
+        template. If ``None``, all volumes are motion eligible. Default
+        ``None``.
+    motion_metric : ``'framewise_displacement'`` | ``'euclidean_norm'``
+        Metric used to calculate the motion score from consecutive volumes.
+        ``'framewise_displacement'`` sums the absolute translation and
+        rotation changes, while ``'euclidean_norm'`` calculates their
+        Euclidean norm. Rotations are converted to displacement using
+        ``head_radius`` before either metric is calculated. Default
+        ``'framewise_displacement'``.
     head_radius : float
         Head radius in mm used to convert rotation changes to displacement.
         Default 50.
@@ -85,6 +90,7 @@ class GradientRemover:
         motion=None,
         motion_source=None,
         motion_threshold=None,
+        motion_metric="framewise_displacement",
         head_radius=50.0,
         tr_tol=0,
     ):
@@ -113,15 +119,19 @@ class GradientRemover:
             )
         self._data = eeg_data
         self._motion_parameters = _load_motion(motion, motion_source, n_tr=self.n_tr)
-        self._framewise_displacement = _compute_framewise_displacement(
-            self.motion_parameters, head_radius, motion_threshold
+        _check_option(
+            "motion_metric",
+            motion_metric,
+            ("framewise_displacement", "euclidean_norm"),
+        )
+        self._motion_metric = motion_metric
+        self._motion_score = _compute_motion_score(
+            self.motion_parameters, head_radius, motion_threshold, motion_metric
         )
         if motion_threshold is None:
             self._motion_eligible = np.ones(self.n_tr, bool)
         else:
-            self._motion_eligible = self.framewise_displacement <= float(
-                motion_threshold
-            )
+            self._motion_eligible = self.motion_score <= float(motion_threshold)
         if self.motion_eligible.sum() < self.n_seed + 1:
             raise ValueError(
                 f"At least {self.n_seed + 1} motion-eligible volumes are required "
@@ -177,9 +187,14 @@ class GradientRemover:
         return self._motion_parameters
 
     @property
-    def framewise_displacement(self):
-        """The framewise displacement in mm, or ``None`` if motion was omitted."""
-        return self._framewise_displacement
+    def motion_metric(self):
+        """The metric used to calculate the motion score."""
+        return self._motion_metric
+
+    @property
+    def motion_score(self):
+        """The motion score in mm, or ``None`` if motion was omitted."""
+        return self._motion_score
 
     @property
     def motion_eligible(self):
@@ -421,7 +436,7 @@ def _load_motion(motion, motion_source, *, n_tr):
     return np.concatenate([translations, rotations], axis=1)
 
 
-def _compute_framewise_displacement(parameters, head_radius, motion_threshold):
+def _compute_motion_score(parameters, head_radius, motion_threshold, motion_metric):
     head_radius = float(_ensure_nonnegative_number(head_radius, "head_radius"))
     if motion_threshold is not None:
         _ensure_nonnegative_number(motion_threshold, "motion_threshold")
@@ -430,9 +445,12 @@ def _compute_framewise_displacement(parameters, head_radius, motion_threshold):
     if parameters is None:
         return None
     differences = np.diff(parameters, axis=0)
-    displacement = np.abs(differences[:, :3]).sum(axis=1)
-    displacement += head_radius * np.abs(differences[:, 3:]).sum(axis=1)
-    return np.concatenate([[0.0], displacement])
+    differences[:, 3:] *= head_radius
+    if motion_metric == "framewise_displacement":
+        score = np.abs(differences).sum(axis=1)
+    else:
+        score = np.linalg.norm(differences, axis=1)
+    return np.concatenate([[0.0], score])
 
 
 def _median_channel_correlation(epoch, template):
@@ -458,6 +476,7 @@ def remove_fmri_gradient_artifact(
     motion=None,
     motion_source=None,
     motion_threshold=None,
+    motion_metric="framewise_displacement",
     head_radius=50.0,
     tr_tol=0,
     picks=None,
@@ -502,9 +521,12 @@ def remove_fmri_gradient_artifact(
         Software that produced ``motion``. See :class:`GradientRemover` for
         the expected column order and units for each source.
     motion_threshold : float | None
-        Maximum framewise displacement in mm for a volume to contribute to a
-        template. If ``None``, all volumes are motion eligible. Default
-        ``None``.
+        Maximum motion score in mm for a volume to contribute to a template.
+        If ``None``, all volumes are motion eligible. Default ``None``.
+    motion_metric : ``'framewise_displacement'`` | ``'euclidean_norm'``
+        Metric used to calculate the motion score from consecutive volumes.
+        See :class:`GradientRemover` for details. Default
+        ``'framewise_displacement'``.
     head_radius : float
         Head radius in mm used to convert rotation changes to displacement.
         Default 50.
@@ -559,6 +581,7 @@ def remove_fmri_gradient_artifact(
         motion=motion,
         motion_source=motion_source,
         motion_threshold=motion_threshold,
+        motion_metric=motion_metric,
         head_radius=head_radius,
         tr_tol=tr_tol,
     )
@@ -567,7 +590,7 @@ def remove_fmri_gradient_artifact(
         n_motion_bad = np.sum(~remover.motion_eligible)
         logger.info(
             f"Excluded {n_motion_bad} of {remover.n_tr} volumes from template "
-            "construction based on MRI-estimated motion"
+            f"construction based on MRI-estimated motion ({motion_metric})"
         )
     if correlation_threshold is not None:
         n_candidates = sum(len(indices) for indices in remover.candidate_indices)

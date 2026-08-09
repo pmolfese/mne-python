@@ -176,7 +176,20 @@ def test_motion_sources(motion_source, tmp_path):
         motion_threshold=8.0,
     )
     assert_allclose(remover.motion_parameters, expected)
-    assert_allclose(remover.framewise_displacement[:3], (0.0, 9.0, 9.0))
+    assert remover.motion_metric == "framewise_displacement"
+    assert_allclose(remover.motion_score[:3], (0.0, 9.0, 9.0))
+    assert_array_equal(remover.motion_eligible[:3], np.array([True, False, False]))
+
+    remover = GradientRemover(
+        _sample_data(),
+        _sample_trs(),
+        motion=motion,
+        motion_source=motion_source,
+        motion_threshold=4.0,
+        motion_metric="euclidean_norm",
+    )
+    assert remover.motion_metric == "euclidean_norm"
+    assert_allclose(remover.motion_score[:3], (0.0, np.sqrt(17.5), np.sqrt(17.5)))
     assert_array_equal(remover.motion_eligible[:3], np.array([True, False, False]))
 
 
@@ -190,6 +203,8 @@ def test_motion_validation():
         GradientRemover(data, trs, motion_source="afni")
     with pytest.raises(ValueError, match="Invalid value for.*motion_source"):
         GradientRemover(data, trs, motion=motion, motion_source="bad")
+    with pytest.raises(ValueError, match="Invalid value for.*motion_metric"):
+        GradientRemover(data, trs, motion_metric="bad")
     with pytest.raises(ValueError, match=r"shape \(n_trs, 6\)"):
         GradientRemover(data, trs, motion=motion[:, :5], motion_source="spm")
     with pytest.raises(ValueError, match="exactly one row per TR"):
