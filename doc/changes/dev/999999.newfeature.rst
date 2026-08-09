@@ -1,0 +1,1 @@
+Extend :func:`mne.preprocessing.remove_fmri_gradient_artifact` and :class:`mne.preprocessing.GradientRemover` with robust, volume-locked artifact templates that can exclude volumes using AFNI, FSL, or SPM motion estimates, with framewise displacement or Euclidean norm thresholding, and waveform correlation, by `Peter Molfese`_.
