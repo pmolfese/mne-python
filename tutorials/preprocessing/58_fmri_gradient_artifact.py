@@ -228,12 +228,33 @@ raw.plot()
 # %%
 # Remove the gradient artifact
 # ------------------------------
-# :func:`~mne.preprocessing.remove_fmri_gradient_artifact` implements average
-# artifact subtraction (AAS): for each TR, it builds a template by averaging
-# neighboring TRs (``window=(4, 4)`` here averages the 4 TRs before and the 4
-# TRs after) and subtracts it.
+# :func:`~mne.preprocessing.remove_fmri_gradient_artifact` implements robust,
+# volume-locked average artifact subtraction (AAS). For each TR, it builds a
+# template from up to ``n_average`` nearby volumes, excluding the target
+# volume. The first ``n_seed`` motion-eligible volumes seed the template, and
+# subsequent volumes are included only when their artifact waveform correlates
+# sufficiently with the evolving template.
 
-raw_clean = remove_fmri_gradient_artifact(raw, events, window=(4, 4))
+raw_clean = remove_fmri_gradient_artifact(raw, events, n_average=25)
+
+# %%
+# MRI-estimated motion can optionally be used to prevent high-motion volumes
+# from contributing to the artifact templates. The ``motion`` argument can be
+# a six-column array or a path to a text file produced by AFNI ``3dvolreg``,
+# FSL ``mcflirt``, or SPM realignment. It must contain exactly one row per TR
+# event. For example, an AFNI motion file could be supplied as follows::
+#
+#     raw_clean = remove_fmri_gradient_artifact(
+#         raw,
+#         events,
+#         motion="motion.1D",
+#         motion_source="afni",
+#         motion_threshold=0.5,
+#     )
+#
+# Here, ``motion_threshold`` is framewise displacement in millimeters. A
+# volume above the threshold is still corrected, but it cannot contribute to
+# any artifact template.
 
 # %%
 # Filter the cleaned data
@@ -251,11 +272,8 @@ filt = raw_clean.filter(l_freq=1.0, h_freq=30, n_jobs=2)
 # so we pass an explicit ``scalings`` value matched to our synthetic noise
 # amplitude for a readable plot.
 #
-# .. note::
-#     The first 4 TRs are not cleaned, since they were needed to build the
-#     averaging template for artifact removal (``window=(4, 4)`` looks 4 TRs
-#     ahead and behind). You can see the gradient artifact's continued
-#     presence at the start of the plot below.
+# Edge volumes are corrected using asymmetric sets of nearby volumes, so the
+# complete imaging period is corrected.
 
 filt.plot(scalings=dict(eeg=500e-6))
 

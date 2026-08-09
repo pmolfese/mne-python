@@ -5,157 +5,259 @@
 
 import numpy as np
 import pytest
-from numpy.testing import assert_allclose
+from numpy.testing import assert_allclose, assert_array_equal
 
 from mne import create_info
 from mne.io import RawArray
 from mne.preprocessing import GradientRemover, remove_fmri_gradient_artifact
+from mne.utils import catch_logging
 
-N_TRS = 10
+N_TRS = 30
 TR_CODE = 1
 SAMPS_PER_TR = 100
 N_CHANNELS = 8
 
 
 def _sample_trs():
-    return np.asarray([x * SAMPS_PER_TR for x in range(N_TRS)])
+    return np.arange(N_TRS) * SAMPS_PER_TR
 
 
 def _sample_trs_longform():
-    return np.asarray([[x * SAMPS_PER_TR, 0, TR_CODE] for x in range(N_TRS)])
+    return np.c_[_sample_trs(), np.zeros(N_TRS, int), np.full(N_TRS, TR_CODE)]
 
 
 def _sample_data():
     return np.zeros((N_CHANNELS, N_TRS * SAMPS_PER_TR))
 
 
-def test_window_validity():
-    """Test validation of the template window."""
-    data, trs = _sample_data(), _sample_trs()
-    with pytest.raises(ValueError, match=r"Integer windows must be even"):
-        GradientRemover(data, trs, 5)
-    with pytest.raises(ValueError, match=r"Tuple windows must contain"):
-        GradientRemover(data, trs, (2, 2, 2))
-    with pytest.raises(TypeError, match=r"Window must be a positive"):
-        GradientRemover(data, trs, None)
-    with pytest.raises(ValueError, match=r"Window must contain"):
-        GradientRemover(data, trs, (-1, 1))
-    with pytest.raises(ValueError, match=r"Window must contain"):
-        GradientRemover(data, trs, (1, -1))
-    with pytest.raises(ValueError, match=r"Window must contain"):
-        GradientRemover(data, trs, (0, 0))
+def _repeating_data():
+    artifact = np.random.default_rng(42).standard_normal((N_CHANNELS, SAMPS_PER_TR))
+    return np.tile(artifact, (1, N_TRS))
 
-    assert GradientRemover(data, trs, (2, 2)).window == (2, 2)
-    assert GradientRemover(data, trs, 4).window == (2, 2)
+
+def test_parameter_validity():
+    """Test validation of template construction parameters."""
+    data, trs = _sample_data(), _sample_trs()
+    with pytest.raises(ValueError, match="eeg_data must have shape"):
+        GradientRemover(data[0], trs)
+    for name, kwargs in (
+        ("n_average", dict(n_average=0)),
+        ("n_seed", dict(n_seed=0)),
+    ):
+        with pytest.raises(ValueError, match=rf"{name} must be a positive"):
+            GradientRemover(data, trs, **kwargs)
+    with pytest.raises(TypeError, match="n_average must be an instance"):
+        GradientRemover(data, trs, n_average=2.5)
+    with pytest.raises(ValueError, match="must not exceed n_average"):
+        GradientRemover(data, trs, n_average=4, n_seed=5)
+    for threshold in (-0.1, 1.1):
+        with pytest.raises(ValueError, match="correlation_threshold"):
+            GradientRemover(data, trs, correlation_threshold=threshold)
+    with pytest.raises(ValueError, match="correlation_threshold must be finite"):
+        GradientRemover(data, trs, correlation_threshold=np.nan)
+
+    remover = GradientRemover(data, trs, n_average=10, n_seed=3)
+    assert remover.n_average == 10
+    assert remover.n_seed == 3
+    assert remover.correlation_threshold == 0.975
+    remover = GradientRemover(data, trs, n_average=5, n_seed=5)
+    assert len(remover.get_tr_template(0)) == N_CHANNELS
+    assert len(remover.template_indices[0]) == 5
 
 
 def test_tr_events_validity():
     """Test validation of tr_events."""
     data = _sample_data()
-
+    with pytest.raises(ValueError, match="At least two TR"):
+        GradientRemover(data, np.array([0]))
     with pytest.raises(ValueError, match=r"TRs must be a 1D array or"):
-        GradientRemover(data, np.asarray([[1, 2], [1, 2]]))
-
-    with pytest.raises(ValueError, match=r"tr_tol must be a non-negative"):
+        GradientRemover(data, np.array([[1, 2], [1, 2]]))
+    with pytest.raises(ValueError, match="integer sample numbers"):
+        GradientRemover(data, _sample_trs().astype(float) + 0.1)
+    with pytest.raises(ValueError, match="strictly increasing"):
+        GradientRemover(data, _sample_trs()[::-1])
+    with pytest.raises(ValueError, match="tr_tol must be non-negative"):
         GradientRemover(data, _sample_trs(), tr_tol=-1)
 
     trs = _sample_trs()
-    trs[1] = trs[1] + 5  # short form, spacing far outside tolerance
-    with pytest.raises(ValueError, match=r"TR spacings are not"):
+    trs[1] += 5
+    with pytest.raises(ValueError, match="TR spacings are not consistent"):
         GradientRemover(data, trs)
-    trs = _sample_trs_longform()
-    trs[1, 0] = trs[1, 0] + 5  # long form, spacing far outside tolerance
-    with pytest.raises(ValueError, match=r"TR spacings are not"):
-        GradientRemover(data, trs)
+    with pytest.raises(ValueError, match="TR spacings are not consistent"):
+        GradientRemover(data, np.c_[trs, np.zeros((N_TRS, 2), int)])
 
-    # both short and long form give the same result
-    gr = GradientRemover(data, _sample_trs())
-    assert gr.tr_spacing == SAMPS_PER_TR
-    assert gr.n_tr == N_TRS
-    assert GradientRemover(data, _sample_trs_longform()).n_tr == N_TRS
+    remover = GradientRemover(data, _sample_trs_longform())
+    assert remover.tr_spacing == SAMPS_PER_TR
+    assert remover.n_tr == N_TRS
 
 
 def test_tr_events_jitter_tolerance():
     """Test that small TR-spacing jitter is tolerated but not accumulated."""
-    data = _sample_data()
-    # shift a single TR onset by 1 sample (within tr_tol=1); this perturbs
-    # the two adjacent spacings by +1 and -1 respectively
     trs = _sample_trs().copy()
     trs[5] += 1
-    gr = GradientRemover(data, trs, tr_tol=1)
-    assert gr.tr_spacing == SAMPS_PER_TR  # median spacing unaffected
-    # each TR is anchored at its own onset, so jitter does not accumulate:
-    # the last TR's bounds should start near its own (jittered) sample, not
-    # drift by N_TRS worth of jitter
-    last_start, _ = gr._tr_bounds(N_TRS - 1)
-    assert last_start == trs[-1]
+    remover = GradientRemover(_sample_data(), trs, tr_tol=1)
+    assert remover.tr_spacing == SAMPS_PER_TR
+    assert remover._tr_bounds(5)[0] == trs[5]
 
-    # a deviation larger than tr_tol still raises
-    trs_bad = _sample_trs()
-    trs_bad[1] += 2
-    with pytest.raises(ValueError, match=r"TR spacings are not"):
-        GradientRemover(data, trs_bad, tr_tol=1)
-    # ...but is tolerated with a larger tr_tol
-    GradientRemover(data, trs_bad, tr_tol=2)
+    trs[5] += 1
+    with pytest.raises(ValueError, match="TR spacings are not consistent"):
+        GradientRemover(_sample_data(), trs, tr_tol=1)
 
 
-def test_get_tr():
-    """Test per-TR indexing."""
-    gr = GradientRemover(_sample_data(), _sample_trs())
-    with pytest.raises(ValueError, match=r"Index -1"):
-        gr.get_tr(-1)
-    with pytest.raises(ValueError, match=r"Index"):
-        gr.get_tr(len(_sample_trs()) + 1)
-    assert gr.get_tr(0).shape[1] == gr.tr_spacing
+def test_template_construction_and_edges():
+    """Test moving leave-one-out template construction at all volumes."""
+    data = _repeating_data()
+    remover = GradientRemover(
+        data, _sample_trs(), n_average=25, correlation_threshold=None
+    )
+    corrected = remover.correct()
+    assert_allclose(corrected, 0, atol=1e-12)
+    assert remover.corrected is corrected
+    for target in (0, N_TRS // 2, N_TRS - 1):
+        indices = remover.template_indices[target]
+        assert len(indices) == 25
+        assert target not in indices
+        assert_allclose(remover.get_tr_template(target), data[:, :SAMPS_PER_TR])
+
+    with pytest.raises(ValueError, match="Index -1"):
+        remover.get_tr(-1)
+    with pytest.raises(ValueError, match="Index"):
+        remover.get_tr(N_TRS)
 
 
-def test_correction_removes_artifact():
-    """Test that a repeating artifact is subtracted away."""
-    rng = np.random.default_rng(42)
-    trs = _sample_trs()
-    # identical artifact repeated every TR + small noise -> should cancel
-    artifact = rng.standard_normal((N_CHANNELS, SAMPS_PER_TR))
-    data = np.tile(artifact, (1, N_TRS)).astype(float)
-    gr = GradientRemover(data, trs, window=(4, 4))
-    corrected = gr.correct()
-    # corrected property is cached and identical
-    assert_allclose(gr.corrected, corrected)
-    # in the interior (where a full template exists) the artifact is removed
-    interior = corrected[:, 4 * SAMPS_PER_TR : 6 * SAMPS_PER_TR]
-    assert_allclose(interior, 0, atol=1e-10)
+def test_correlation_rejection():
+    """Test rejection and replacement of an atypical artifact volume."""
+    data = _repeating_data()
+    data[:, 10 * SAMPS_PER_TR : 11 * SAMPS_PER_TR] *= -1
+    remover = GradientRemover(data, _sample_trs(), n_average=20)
+    remover.get_tr_template(0)
+    candidates = remover.candidate_indices[0]
+    bad_idx = np.where(candidates == 10)[0].item()
+    assert remover.correlations[0][bad_idx] < 0
+    assert not remover.correlation_eligible[0][bad_idx]
+    assert 10 not in remover.template_indices[0]
+    assert len(remover.template_indices[0]) == 20
+
+    remover = GradientRemover(
+        data, _sample_trs(), n_average=20, correlation_threshold=None
+    )
+    remover.get_tr_template(0)
+    assert 10 in remover.template_indices[0]
 
 
-def test_template_window_uses_requested_trs():
-    """Test that before and after template windows have the requested width."""
-    data = _sample_data()
-    gr = GradientRemover(data, _sample_trs(), window=(2, 3))
-    gr.get_tr_detrended = lambda tr: np.full((N_CHANNELS, SAMPS_PER_TR), tr)
+@pytest.mark.parametrize("motion_source", ("afni", "fsl", "spm"))
+def test_motion_sources(motion_source, tmp_path):
+    """Test normalization of AFNI, FSL, and SPM motion parameters."""
+    translations = np.zeros((N_TRS, 3))
+    rotations = np.zeros((N_TRS, 3))
+    translations[1] = (1.0, 2.0, 3.0)
+    rotations[1] = (0.01, 0.02, 0.03)
+    expected = np.c_[translations, rotations]
+    if motion_source == "afni":
+        motion = np.c_[
+            np.rad2deg(rotations[:, 2]),
+            np.rad2deg(rotations[:, 0]),
+            np.rad2deg(rotations[:, 1]),
+            translations[:, 2],
+            translations[:, 0],
+            translations[:, 1],
+        ]
+    elif motion_source == "fsl":
+        motion = np.c_[rotations, translations]
+    else:
+        motion = expected
+    motion_path = tmp_path / f"motion_{motion_source}.txt"
+    np.savetxt(motion_path, motion)
+    remover = GradientRemover(
+        _sample_data(),
+        _sample_trs(),
+        motion=motion_path,
+        motion_source=motion_source,
+        motion_threshold=8.0,
+    )
+    assert_allclose(remover.motion_parameters, expected)
+    assert_allclose(remover.framewise_displacement[:3], (0.0, 9.0, 9.0))
+    assert_array_equal(remover.motion_eligible[:3], np.array([True, False, False]))
 
-    # At TR 3, the before window is TRs 1 and 2, and the after window is
-    # TRs 4, 5, and 6.
-    assert_allclose(gr.get_tr_template(3), 0.4 * 1.5 + 0.6 * 5.0)
-    assert_allclose(gr.get_tr_template(N_TRS - 3), 0.0)
+
+def test_motion_validation():
+    """Test validation of motion inputs."""
+    data, trs = _sample_data(), _sample_trs()
+    motion = np.zeros((N_TRS, 6))
+    with pytest.raises(ValueError, match="must be provided when motion"):
+        GradientRemover(data, trs, motion=motion)
+    with pytest.raises(ValueError, match="cannot be provided"):
+        GradientRemover(data, trs, motion_source="afni")
+    with pytest.raises(ValueError, match="Invalid value for.*motion_source"):
+        GradientRemover(data, trs, motion=motion, motion_source="bad")
+    with pytest.raises(ValueError, match=r"shape \(n_trs, 6\)"):
+        GradientRemover(data, trs, motion=motion[:, :5], motion_source="spm")
+    with pytest.raises(ValueError, match="exactly one row per TR"):
+        GradientRemover(data, trs, motion=motion[:-1], motion_source="spm")
+    motion[0, 0] = np.nan
+    with pytest.raises(ValueError, match="only finite"):
+        GradientRemover(data, trs, motion=motion, motion_source="spm")
+    with pytest.raises(ValueError, match="motion must be provided"):
+        GradientRemover(data, trs, motion_threshold=0.5)
+
+
+def test_motion_eligibility_and_diagnostics():
+    """Test that high-motion volumes do not contribute to templates."""
+    motion = np.zeros((N_TRS, 6))
+    motion[10:, 0] = 1.0
+    remover = GradientRemover(
+        _repeating_data(),
+        _sample_trs(),
+        motion=motion,
+        motion_source="spm",
+        motion_threshold=0.5,
+        n_average=20,
+    )
+    assert not remover.motion_eligible[10]
+    remover.correct()
+    for indices in remover.template_indices:
+        assert 10 not in indices
+        assert len(indices) == 20
+    assert all(indices is not None for indices in remover.candidate_indices)
+    assert all(mask is not None for mask in remover.correlation_eligible)
+
+    motion[:, 0] = np.arange(N_TRS)
+    with pytest.raises(ValueError, match="motion-eligible volumes are required"):
+        GradientRemover(
+            _sample_data(),
+            _sample_trs(),
+            motion=motion,
+            motion_source="spm",
+            motion_threshold=0.5,
+        )
 
 
 def test_remove_fmri_gradient_artifact():
     """Test the Raw-level wrapper."""
     info = create_info(N_CHANNELS, sfreq=100.0, ch_types="eeg")
-    artifact = np.random.default_rng(0).standard_normal((N_CHANNELS, SAMPS_PER_TR))
-    data = np.tile(artifact, (1, N_TRS)).astype(float)
+    data = _repeating_data()
     raw = RawArray(data, info)
+    motion = np.zeros((N_TRS, 6))
+    motion[10:, 0] = 1.0
 
-    out = remove_fmri_gradient_artifact(raw, _sample_trs(), window=(4, 4))
-    assert out is not raw  # copy by default
-    assert_allclose(raw.get_data(), data)  # original untouched
-    interior = out.get_data()[:, 4 * SAMPS_PER_TR : 6 * SAMPS_PER_TR]
-    assert_allclose(interior, 0, atol=1e-10)
+    with catch_logging() as log:
+        out = remove_fmri_gradient_artifact(
+            raw,
+            _sample_trs(),
+            motion=motion,
+            motion_source="spm",
+            motion_threshold=0.5,
+            verbose=True,
+        )
+    assert out is not raw
+    assert_allclose(raw.get_data(), data)
+    assert_allclose(out.get_data(), 0, atol=1e-12)
+    log = log.getvalue()
+    assert "Excluded 1 of 30 volumes" in log
+    assert "Templates contained 25-25 volumes" in log
 
-    # in place
     out = remove_fmri_gradient_artifact(raw, _sample_trs_longform(), copy=False)
     assert out is raw
-
-    with pytest.raises(ValueError, match="Invalid value for.*method"):
-        remove_fmri_gradient_artifact(raw, _sample_trs(), method="bad")
 
     raw_nopreload = RawArray(data, info)
     raw_nopreload.preload = False
